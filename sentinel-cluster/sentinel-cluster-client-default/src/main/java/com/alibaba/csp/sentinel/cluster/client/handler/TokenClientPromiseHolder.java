@@ -15,9 +15,11 @@
  */
 package com.alibaba.csp.sentinel.cluster.client.handler;
 
-import java.util.AbstractMap.SimpleEntry;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
 
 import com.alibaba.csp.sentinel.cluster.response.ClusterResponse;
 
@@ -29,36 +31,41 @@ import io.netty.channel.ChannelPromise;
  */
 public final class TokenClientPromiseHolder {
 
-    private static final Map<Integer, SimpleEntry<ChannelPromise, ClusterResponse>> PROMISE_MAP = new ConcurrentHashMap<>();
+    private static final Map<Integer, TokenPromise> PROMISE_MAP = new ConcurrentHashMap<>();
+    private static final int CPU_SIZE = Runtime.getRuntime().availableProcessors();
+    private static final ThreadPoolExecutor EXECUTOR = new ThreadPoolExecutor(CPU_SIZE, CPU_SIZE, 0L,
+            TimeUnit.MILLISECONDS, new LinkedBlockingQueue<Runnable>());
 
-    public static void putPromise(int xid, ChannelPromise promise) {
-        PROMISE_MAP.put(xid, new SimpleEntry<ChannelPromise, ClusterResponse>(promise, null));
-    }
-
-    public static SimpleEntry<ChannelPromise, ClusterResponse> getEntry(int xid) {
-        return PROMISE_MAP.get(xid);
+    public static void putPromise(int xid, TokenPromise promise) {
+        PROMISE_MAP.put(xid, promise);
     }
 
     public static void remove(int xid) {
         PROMISE_MAP.remove(xid);
     }
 
-    public static <T> boolean completePromise(int xid, ClusterResponse<T> response) {
-        if (!PROMISE_MAP.containsKey(xid)) {
-            return false;
+    public static <T> void completePromise(int xid, ClusterResponse<T> response) {
+        final TokenPromise tokenPromise = PROMISE_MAP.get(xid);
+        if (tokenPromise == null) {
+            // timeout
+            return;
         }
-        SimpleEntry<ChannelPromise, ClusterResponse> entry = PROMISE_MAP.get(xid);
-        if (entry != null) {
-            ChannelPromise promise = entry.getKey();
-            if (promise.isDone() || promise.isCancelled()) {
-                return false;
+        EXECUTOR.submit(() -> {
+            try {
+                ChannelPromise promise = tokenPromise.getPromiseValue();
+                if (promise == null) {
+                    return;
+                }
+                if (promise.isDone() || promise.isCancelled()) {
+                    return;
+                }
+                tokenPromise.setResponseValue(response);
+                promise.setSuccess();
+            } catch (InterruptedException e) {
             }
-            entry.setValue(response);
-            promise.setSuccess();
-            return true;
-        }
-        return false;
+        });
     }
 
-    private TokenClientPromiseHolder() {}
+    private TokenClientPromiseHolder() {
+    }
 }
